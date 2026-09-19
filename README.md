@@ -23,6 +23,15 @@ DHANANJAY is a computer vision-based prototype that detects additional people ar
 - Haar Cascade
 - Pygame
 
+### How It Works
+
+Webcam
+→ Face Detection
+→ Face Count Analysis
+→ Threat Status
+→ Alert
+→ Activity Logging
+
 ### Future Scope
 
 - Person tracking
@@ -35,8 +44,8 @@ DHANANJAY is a computer vision-based prototype that detects additional people ar
 
 **Tech Trojans**
 
-Lakshya Bhatodra  
-Aastha Rathore    
-Anisha Bairagi
-Ashmit Yadav  
-Khushi Chouhan
+- Lakshya Bhatodra
+- Aastha Rathore
+- Ashmit Yadav
+- Anisha Bairagi
+- Khushi Chouhan
