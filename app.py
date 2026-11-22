@@ -1,652 +1,426 @@
-import streamlit as st
-import cv2
-import os
-import pygame
+import threading
 from datetime import datetime
+from pathlib import Path
 
-# =========================================================
-# PAGE CONFIG
-# =========================================================
+import av
+import cv2
+import numpy as np
+import streamlit as st
+import streamlit.components.v1 as components
+from streamlit_webrtc import RTCConfiguration, WebRtcMode, webrtc_streamer
+from streamlit_autorefresh import st_autorefresh
+
 st.set_page_config(
-    page_title="Shoulder Surfing Detector",
+    page_title="DHANANJAY | Security Console",
     page_icon="🛡️",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# =========================================================
-# FACE DETECTOR (Haar Cascade) - loaded once
-# =========================================================
-if "face_cascade" not in st.session_state:
-    st.session_state.face_cascade = cv2.CascadeClassifier(
-        "haarcascade_frontalface_default.xml"
-    )
+BASE_DIR = Path(__file__).parent
+CASCADE_PATH = BASE_DIR / "haarcascade_frontalface_default.xml"
+LOG_PATH = BASE_DIR / "log.txt"
 
-face_cascade = st.session_state.face_cascade
+CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+:root { color-scheme: dark; }
+html, body, [class*="css"] { font-family: Inter, sans-serif; }
+.stApp { background: #0b1120; color: #e5eaf2; }
+[data-testid="stSidebar"] { background: #0e1728; border-right: 1px solid #263449; }
+[data-testid="stHeader"] { background: rgba(11,17,32,.92); }
+#MainMenu, footer { visibility: hidden; }
+h1,h2,h3 { letter-spacing: -.025em; }
+.brand { font-size: 29px; font-weight: 700; letter-spacing: .08em; color: #e8eef8; }
+.brand span { color: #43b8c8; }
+.eyebrow { color:#8293aa; font: 11px 'JetBrains Mono',monospace; letter-spacing:.16em; text-transform:uppercase; }
+.page-title { font-size: 25px; font-weight: 650; color:#edf3fb; margin: 4px 0 2px; }
+.page-subtitle { color:#91a0b5; font-size:13px; margin-bottom:20px; }
+.card { background:#111d30; border:1px solid #26364c; border-radius:12px; padding:17px 18px; min-height:105px; }
+.metric-label { color:#91a0b5; font-size:11px; letter-spacing:.1em; text-transform:uppercase; }
+.metric-value { color:#edf3fb; font:600 25px 'JetBrains Mono',monospace; margin-top:9px; }
+.metric-note { color:#7f91a9; font-size:11px; margin-top:5px; }
+.status-pill { display:inline-block; border-radius:20px; padding:5px 10px; font:11px 'JetBrains Mono',monospace; letter-spacing:.05em; }
+.good { color:#5dd6a0; background:#123328; border:1px solid #245b48; }
+.bad { color:#ff7b85; background:#3b1d29; border:1px solid #71313f; }
+.neutral { color:#a8b8ca; background:#1c2a3d; border:1px solid #34465d; }
+.workspace { background:#111d30; border:1px solid #30435a; border-radius:12px; padding:20px; }
+.workspace-label { color:#8fa1b8; font:11px 'JetBrains Mono',monospace; letter-spacing:.12em; }
+.log-entry { padding:10px 0; border-bottom:1px solid #24334a; color:#c6d2e1; font:12px 'JetBrains Mono',monospace; }
+div[data-testid="stButton"] button { border-radius:8px; font-weight:600; min-height:40px; }
+div[data-testid="stTabs"] button { font-weight:600; }
+small, .stCaption { color:#8fa1b8 !important; }
+</style>
+"""
+st.markdown(CSS, unsafe_allow_html=True)
 
-# =========================================================
-# PYGAME ALARM SETUP - initialized ONCE per session
-# =========================================================
-ALARM_FILE = "alert.wav"
+# Session state
+defaults = {
+    "shared": {
+        "lock": threading.Lock(), "faces": 0, "authorized": 0,
+        "unauthorized": 0, "threat": False, "last_event": "Waiting for camera",
+    },
+    "samples": [],
+    "recognizer": None,
+    "logs": [],
+    "alarm_enabled": True,
+    "threshold": 75.0,
+    "last_logged_state": None,
+}
+for key, value in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
-if "pygame_ready" not in st.session_state:
-    pygame.mixer.init()
-    st.session_state.pygame_ready = True
-
-if "alarm_sound" not in st.session_state:
-    if os.path.exists(ALARM_FILE):
-        st.session_state.alarm_sound = pygame.mixer.Sound(ALARM_FILE)
-    else:
-        st.session_state.alarm_sound = None
-
-if "alarm_channel" not in st.session_state:
-    st.session_state.alarm_channel = None
-
-if "alarm_playing" not in st.session_state:
-    st.session_state.alarm_playing = False
-
-
-def start_alarm():
-    """Play alarm continuously. Prevents overlapping / repeated play() calls."""
-    if st.session_state.alarm_sound is not None and not st.session_state.alarm_playing:
-        st.session_state.alarm_channel = st.session_state.alarm_sound.play(loops=-1)
-        st.session_state.alarm_playing = True
-
-
-def stop_alarm():
-    """Stop alarm immediately if it is playing."""
-    if st.session_state.alarm_playing:
-        if st.session_state.alarm_channel is not None:
-            st.session_state.alarm_channel.stop()
-        st.session_state.alarm_channel = None
-        st.session_state.alarm_playing = False
-
-
-# =========================================================
-# ACTIVITY LOG STATE
-# =========================================================
-if "activity_log" not in st.session_state:
-    st.session_state.activity_log = []
+cascade = cv2.CascadeClassifier(str(CASCADE_PATH))
+if cascade.empty():
+    st.error("Face detector file missing. Keep haarcascade_frontalface_default.xml in the same folder as app.py.")
+    st.stop()
 
 
 def add_log(message):
-    """Newest entry on top, capped at 15 entries."""
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    st.session_state.activity_log.insert(0, (timestamp, message))
-    st.session_state.activity_log = st.session_state.activity_log[:15]
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"{stamp} | {message}"
+    if not st.session_state.logs or st.session_state.logs[0] != entry:
+        st.session_state.logs.insert(0, entry)
+        st.session_state.logs = st.session_state.logs[:100]
+    try:
+        with LOG_PATH.open("a", encoding="utf-8") as file:
+            file.write(entry + "\n")
+    except OSError:
+        pass
 
 
-# =========================================================
-# GLOBAL CSS - Premium Cybersecurity Dashboard Theme
-# =========================================================
-BASE_CSS = """
-<style>
-
-@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Rajdhani:wght@400;500;600;700&display=swap');
-
-html, body, [class*="css"] {
-    font-family: 'Rajdhani', sans-serif;
-}
-
-.stApp {
-    background: linear-gradient(135deg, #050816 0%, #0F172A 45%, #111827 100%);
-    background-attachment: fixed;
-}
-
-#MainMenu {visibility: hidden;}
-footer {visibility: hidden;}
-header {visibility: hidden;}
-
-/* ---------- Animated Gradient Title ---------- */
-.main-title {
-    text-align: center;
-    font-family: 'Orbitron', sans-serif;
-    font-weight: 900;
-    font-size: 44px;
-    letter-spacing: 2px;
-    background: linear-gradient(90deg, #00E5FF, #8B5CF6, #00FFD1, #00E5FF);
-    background-size: 300% 300%;
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-    animation: gradientMove 6s ease infinite, titleGlow 2.5s ease-in-out infinite;
-    margin-bottom: 0px;
-    padding-top: 10px;
-}
-
-@keyframes gradientMove {
-    0% { background-position: 0% 50%; }
-    50% { background-position: 100% 50%; }
-    100% { background-position: 0% 50%; }
-}
-
-@keyframes titleGlow {
-    0%, 100% { filter: drop-shadow(0 0 8px rgba(0,229,255,0.5)); }
-    50% { filter: drop-shadow(0 0 22px rgba(139,92,246,0.85)); }
-}
-
-.sub-title {
-    text-align: center;
-    color: #94A3B8;
-    font-size: 16px;
-    font-weight: 500;
-    letter-spacing: 3px;
-    text-transform: uppercase;
-    margin-top: 4px;
-    margin-bottom: 28px;
-}
-
-/* ---------- Section Headers ---------- */
-.section-header {
-    font-family: 'Orbitron', sans-serif;
-    font-size: 17px;
-    font-weight: 700;
-    color: #00E5FF;
-    letter-spacing: 1.5px;
-    margin-bottom: 12px;
-    text-shadow: 0 0 12px rgba(0,229,255,0.4);
-}
-
-/* ---------- Camera Card (single persistent container, targeted by key) ---------- */
-/* Streamlit exposes a stable class "st-key-camera_container" for st.container(key="camera_container") */
-div.st-key-camera_container {
-    background: rgba(15, 23, 42, 0.55);
-    backdrop-filter: blur(18px);
-    -webkit-backdrop-filter: blur(18px);
-    border-radius: 20px;
-    padding: 18px;
-    margin-bottom: 20px;
-    border: 2px solid rgba(0, 229, 255, 0.45);
-    box-shadow: 0 0 25px rgba(0, 229, 255, 0.2);
-    transition: border-color 0.6s ease, box-shadow 0.6s ease;
-}
-
-div[data-testid="stImage"] img {
-    border-radius: 14px;
-}
-
-@keyframes redPulse {
-    0%, 100% {
-        border-color: #FF3B5C;
-        box-shadow: 0 0 22px rgba(255,59,92,0.55), inset 0 0 25px rgba(255,59,92,0.08);
-    }
-    50% {
-        border-color: #FF7A90;
-        box-shadow: 0 0 48px rgba(255,59,92,0.95), inset 0 0 35px rgba(255,59,92,0.18);
-    }
-}
-
-/* Alert state: appended dynamically, animates the SAME container (no new card created) */
-div.st-key-camera_container.camera-alert {
-    border-color: #FF3B5C;
-    animation: redPulse 1.2s ease-in-out infinite;
-}
-
-/* Safe state: smooth transition back to cyan, animation cleared */
-div.st-key-camera_container.camera-safe {
-    border-color: rgba(0, 229, 255, 0.45);
-    box-shadow: 0 0 25px rgba(0, 229, 255, 0.2);
-    animation: none;
-}
-
-/* ---------- Metric Cards ---------- */
-.metric-card {
-    background: rgba(17, 24, 39, 0.55);
-    backdrop-filter: blur(16px);
-    -webkit-backdrop-filter: blur(16px);
-    border: 1px solid rgba(139, 92, 246, 0.25);
-    border-radius: 18px;
-    padding: 16px 18px;
-    margin-bottom: 14px;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.35), 0 0 15px rgba(139, 92, 246, 0.08);
-    transition: transform 0.25s ease, box-shadow 0.25s ease, border-color 0.25s ease;
-}
-
-.metric-card:hover {
-    transform: scale(1.035);
-    border-color: rgba(0, 229, 255, 0.55);
-    box-shadow: 0 6px 28px rgba(0,0,0,0.45), 0 0 25px rgba(0, 229, 255, 0.25);
-}
-
-.metric-icon {
-    font-size: 20px;
-    margin-bottom: 4px;
-}
-
-.metric-title {
-    font-size: 12px;
-    font-weight: 600;
-    letter-spacing: 1.5px;
-    text-transform: uppercase;
-    color: #94A3B8;
-    margin-bottom: 6px;
-}
-
-.metric-value {
-    font-family: 'Orbitron', sans-serif;
-    font-size: 21px;
-    font-weight: 700;
-    color: #E2E8F0;
-    letter-spacing: 0.5px;
-}
-
-/* ---------- Badges ---------- */
-.badge {
-    display: inline-block;
-    padding: 5px 14px;
-    border-radius: 30px;
-    font-family: 'Orbitron', sans-serif;
-    font-size: 13px;
-    font-weight: 700;
-    letter-spacing: 1px;
-}
-
-.badge-green {
-    background: rgba(0, 255, 136, 0.12);
-    color: #00FF88;
-    border: 1px solid #00FF88;
-    box-shadow: 0 0 14px rgba(0, 255, 136, 0.55);
-}
-
-.badge-red {
-    background: rgba(255, 59, 92, 0.12);
-    color: #FF3B5C;
-    border: 1px solid #FF3B5C;
-    box-shadow: 0 0 14px rgba(255, 59, 92, 0.55);
-}
-
-.badge-red-flash {
-    background: rgba(255, 59, 92, 0.18);
-    color: #FF3B5C;
-    border: 1px solid #FF3B5C;
-    box-shadow: 0 0 18px rgba(255, 59, 92, 0.75);
-    animation: flashAlarm 1s ease-in-out infinite;
-}
-
-@keyframes flashAlarm {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.5; }
-}
-
-.status-dot {
-    height: 11px;
-    width: 11px;
-    border-radius: 50%;
-    display: inline-block;
-    margin-right: 8px;
-    vertical-align: middle;
-}
-
-.dot-green {
-    background-color: #00FF88;
-    box-shadow: 0 0 10px #00FF88, 0 0 20px #00FF88;
-}
-
-.dot-red {
-    background-color: #FF3B5C;
-    box-shadow: 0 0 10px #FF3B5C, 0 0 20px #FF3B5C;
-}
-
-/* ---------- Status Banner ---------- */
-.status-banner {
-    border-radius: 16px;
-    padding: 14px 20px;
-    font-family: 'Orbitron', sans-serif;
-    font-weight: 700;
-    font-size: 16px;
-    letter-spacing: 1px;
-    text-align: center;
-    margin-bottom: 18px;
-    backdrop-filter: blur(14px);
-}
-
-.banner-secure {
-    background: rgba(0, 255, 136, 0.08);
-    border: 1.5px solid #00FF88;
-    color: #00FF88;
-    box-shadow: 0 0 22px rgba(0, 255, 136, 0.35);
-}
-
-.banner-alert {
-    background: rgba(255, 59, 92, 0.1);
-    border: 1.5px solid #FF3B5C;
-    color: #FF3B5C;
-    box-shadow: 0 0 28px rgba(255, 59, 92, 0.5);
-    animation: flashAlarm 1s ease-in-out infinite;
-}
-
-.banner-idle {
-    background: rgba(148, 163, 184, 0.06);
-    border: 1.5px solid #334155;
-    color: #94A3B8;
-}
-
-/* ---------- Activity Log ---------- */
-.log-card {
-    background: rgba(15, 23, 42, 0.55);
-    backdrop-filter: blur(16px);
-    -webkit-backdrop-filter: blur(16px);
-    border: 1px solid rgba(0, 229, 255, 0.2);
-    border-radius: 20px;
-    padding: 16px 20px;
-    margin-top: 8px;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.35);
-    max-height: 260px;
-    overflow-y: auto;
-}
-
-.log-entry {
-    font-size: 14px;
-    color: #CBD5E1;
-    padding: 6px 0;
-    border-bottom: 1px solid rgba(148,163,184,0.12);
-}
-
-.log-entry:last-child {
-    border-bottom: none;
-}
-
-.log-time {
-    color: #00E5FF;
-    font-weight: 600;
-    margin-right: 8px;
-}
-
-/* ---------- Buttons ---------- */
-.stButton > button {
-    background: linear-gradient(90deg, #00E5FF, #8B5CF6);
-    color: #050816;
-    font-weight: 700;
-    font-family: 'Orbitron', sans-serif;
-    letter-spacing: 1px;
-    border: none;
-    border-radius: 12px;
-    padding: 10px 26px;
-    box-shadow: 0 0 18px rgba(0, 229, 255, 0.35);
-    transition: all 0.25s ease;
-}
-
-.stButton > button:hover {
-    transform: translateY(-2px) scale(1.03);
-    box-shadow: 0 0 28px rgba(139, 92, 246, 0.6);
-    color: #050816;
-}
-
-.stButton > button:active {
-    transform: translateY(0px) scale(0.98);
-}
-
-</style>
-"""
-
-st.markdown(BASE_CSS, unsafe_allow_html=True)
+def read_logs():
+    try:
+        if LOG_PATH.exists():
+            return LOG_PATH.read_text(encoding="utf-8").splitlines()[-100:][::-1]
+    except OSError:
+        pass
+    return st.session_state.logs
 
 
-def set_camera_card_state(state):
-    """
-    Toggle the SAME camera container between 'safe' and 'alert' visual states
-    by injecting a tiny state-marker <style> block that appends a class rule.
-    This is only called when the state actually CHANGES, so the CSS pulse
-    animation runs continuously and smoothly instead of restarting every frame.
-    """
-    if state == "alert":
+def create_recognizer():
+    if not hasattr(cv2, "face"):
+        return None
+    return cv2.face.LBPHFaceRecognizer_create()
+
+
+# Sidebar
+with st.sidebar:
+    st.markdown('<div class="brand">DHANA<span>NJAY</span></div>', unsafe_allow_html=True)
+    st.markdown('<div class="eyebrow">PRIVACY SECURITY CONSOLE</div>', unsafe_allow_html=True)
+    st.divider()
+    st.markdown("**SYSTEM STATUS**")
+    with st.session_state.shared["lock"]:
+        current_threat = st.session_state.shared["threat"]
+    st.markdown(
+        '<span class="status-pill bad">● POTENTIAL THREAT</span>' if current_threat
+        else '<span class="status-pill good">● SYSTEM STANDBY / SECURE</span>',
+        unsafe_allow_html=True,
+    )
+    st.divider()
+    st.markdown("**PROJECT MODULES**")
+    st.caption("Overview · Registration · Live test · Logs")
+    st.divider()
+    st.caption("DHANANJAY / PROTOTYPE BUILD")
+    st.caption("Computer vision-based privacy protection")
+
+st.markdown(
+    '<div class="eyebrow">CYBERSECURITY / COMPUTER VISION</div>'
+    '<div class="page-title">Shoulder Surfing Detection System</div>'
+    '<div class="page-subtitle">Monitor nearby faces and protect confidential on-screen information.</div>',
+    unsafe_allow_html=True,
+)
+
+overview_tab, registration_tab, test_tab, logs_tab, settings_tab = st.tabs(
+    ["Overview", "Face Registration", "Live Security Test", "Activity Logs", "Settings"]
+)
+
+# Overview
+with overview_tab:
+    st.markdown("### Security overview")
+    shared = st.session_state.shared
+    with shared["lock"]:
+        faces_now = shared["faces"]
+        auth_now = shared["authorized"]
+        unauth_now = shared["unauthorized"]
+        threat_now = shared["threat"]
+    monitoring = st.session_state.get("monitoring_active", False)
+    profile_ready = st.session_state.recognizer is not None
+
+    cols = st.columns(4)
+    metrics = [
+        ("FACES DETECTED", faces_now, "Current camera frame"),
+        ("AUTHORIZED", auth_now, "Matched registered profile"),
+        ("UNRECOGNIZED", unauth_now, "No profile match"),
+        ("THREAT STATUS", "HIGH" if threat_now else ("LOW" if monitoring else "IDLE"),
+         "Privacy response state"),
+    ]
+    for col, (label, value, note) in zip(cols, metrics):
+        with col:
+            st.markdown(
+                f'<div class="card"><div class="metric-label">{label}</div>'
+                f'<div class="metric-value">{value}</div><div class="metric-note">{note}</div></div>',
+                unsafe_allow_html=True,
+            )
+    st.write("")
+    left, right = st.columns([1.2, 1])
+    with left:
+        st.markdown("#### System readiness")
         st.markdown(
-            """
-            <style>
-            div.st-key-camera_container {
-                border-color: #FF3B5C !important;
-                animation: redPulse 1.2s ease-in-out infinite !important;
-            }
-            </style>
-            """,
-            unsafe_allow_html=True
+            f'<span class="status-pill {"good" if profile_ready else "neutral"}">'
+            f'● FACE PROFILE {"READY" if profile_ready else "NOT REGISTERED"}</span>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f'<span class="status-pill {"good" if monitoring else "neutral"}">'
+            f'● CAMERA {"ACTIVE" if monitoring else "NOT STARTED"}</span>',
+            unsafe_allow_html=True,
+        )
+        st.write("")
+        st.info("Register your face first, then open Live Security Test and start the camera.")
+    with right:
+        st.markdown("#### Detection policy")
+        st.write("- Any unrecognized face triggers a potential threat.")
+        st.write("- More than one visible face triggers protection.")
+        st.write("- Confidential demo content is blurred during a threat.")
+    st.markdown("#### Confidential workspace preview")
+    if threat_now:
+        st.markdown(
+            '<div class="workspace"><div class="workspace-label">DEMO BANKING PORTAL / LOCKED</div>'
+            '<div style="filter:blur(8px);user-select:none"><h3>Demo User</h3><h2>₹2,45,800</h2>'
+            '<p>Account: XXXX XXXX 4821 · Recent transaction: ₹12,500</p></div>'
+            '<span class="status-pill bad">CONTENT PROTECTED</span></div>', unsafe_allow_html=True
         )
     else:
         st.markdown(
-            """
-            <style>
-            div.st-key-camera_container {
-                border-color: rgba(0, 229, 255, 0.45) !important;
-                box-shadow: 0 0 25px rgba(0, 229, 255, 0.2) !important;
-                animation: none !important;
-            }
-            </style>
-            """,
-            unsafe_allow_html=True
+            '<div class="workspace"><div class="workspace-label">DEMO BANKING PORTAL / PREVIEW</div>'
+            '<h3>Demo User</h3><h2>₹2,45,800</h2>'
+            '<p>Account: XXXX XXXX 4821 · Recent transaction: ₹12,500</p>'
+            '<span class="status-pill good">CONTENT VISIBLE IN DEMO</span></div>', unsafe_allow_html=True
         )
 
-
-# =========================================================
-# HEADER
-# =========================================================
-st.markdown("<div class='main-title'>🛡️ Shoulder Surfing Detector</div>", unsafe_allow_html=True)
-st.markdown("<div class='sub-title'>Real-Time Computer Vision Security Dashboard</div>", unsafe_allow_html=True)
-
-if st.session_state.alarm_sound is None:
-    st.warning("⚠️ 'alert.wav' not found in the app directory. Alarm sound will be disabled until the file is added.")
-
-# =========================================================
-# LAYOUT
-# =========================================================
-left, right = st.columns([2, 1])
-
-with left:
-    st.markdown("<div class='section-header'>📷 LIVE CAMERA FEED</div>", unsafe_allow_html=True)
-    start = st.button("▶  Start Camera")
-
-    # ONE persistent, keyed container. Streamlit keeps this same DOM element
-    # across reruns — we only ever change its CSS classes/colors, never
-    # recreate it, so the border/glow animates smoothly in place.
-    camera_container = st.container(key="camera_container")
-    with camera_container:
-        frame_placeholder = st.empty()
-
-    # Style placeholder used to hold the current state's CSS injection.
-    camera_style_placeholder = st.empty()
-
-    if not start:
-        with camera_style_placeholder:
-            set_camera_card_state("safe")
-        frame_placeholder.markdown(
-            "<div style='text-align:center; padding:90px 20px; color:#64748B; "
-            "font-family:Orbitron,sans-serif; letter-spacing:1px;'>"
-            "⏳ Awaiting camera start...</div>",
-            unsafe_allow_html=True
-        )
-
-with right:
-    st.markdown("<div class='section-header'>📊 SYSTEM STATUS</div>", unsafe_allow_html=True)
-
-    status_placeholder = st.empty()
-
-    col_a, col_b = st.columns(2)
-
-    with col_a:
-        faces_placeholder = st.empty()
-        threat_placeholder = st.empty()
-        camera_placeholder = st.empty()
-
-    with col_b:
-        alarm_placeholder = st.empty()
-        time_placeholder = st.empty()
-        st.empty()
-
-
-# =========================================================
-# HELPER RENDERERS (UI ONLY)
-# =========================================================
-def render_metric_card(placeholder, icon, title, value_html):
-    placeholder.markdown(
-        f"""<div class='metric-card'>
-            <div class='metric-icon'>{icon}</div>
-            <div class='metric-title'>{title}</div>
-            <div class='metric-value'>{value_html}</div>
-        </div>""",
-        unsafe_allow_html=True
-    )
-
-
-def render_idle_dashboard():
-    render_metric_card(faces_placeholder, "👤", "Faces Detected", "0")
-    render_metric_card(threat_placeholder, "⚠️", "Threat Level", "<span class='badge badge-green'>LOW</span>")
-    render_metric_card(alarm_placeholder, "🔔", "Alarm Status", "<span class='badge badge-green'>OFF</span>")
-    render_metric_card(camera_placeholder, "📷", "Camera Status", "<span class='status-dot dot-red'></span>Offline")
-    render_metric_card(time_placeholder, "🕒", "Current Time", datetime.now().strftime("%H:%M:%S"))
-    status_placeholder.markdown(
-        "<div class='status-banner banner-idle'>🛡️ SYSTEM IDLE — CAMERA NOT STARTED</div>",
-        unsafe_allow_html=True
-    )
-
-
-def render_activity_log():
-    if not st.session_state.activity_log:
-        entries_html = "<div class='log-entry'>No activity recorded yet.</div>"
+# Registration
+with registration_tab:
+    st.markdown("### Register authorized user")
+    st.write("Capture multiple samples of the same person. Use consistent lighting and vary the angle slightly.")
+    st.info("For this prototype, samples are held in the current Streamlit session. They are not persistent biometric enrollment.")
+    shot = st.camera_input("Capture face sample", key="registration_camera")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("Add sample", use_container_width=True, disabled=shot is None):
+            image = cv2.imdecode(np.frombuffer(shot.getvalue(), np.uint8), cv2.IMREAD_COLOR)
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            detected = cascade.detectMultiScale(
+                gray, scaleFactor=1.08, minNeighbors=5, minSize=(70, 70)
+            )
+            if len(detected) != 1:
+                st.warning("Exactly one face should be visible. Adjust lighting and try again.")
+            else:
+                x, y, w, h = detected[0]
+                face = cv2.resize(gray[y:y+h, x:x+w], (200, 200), interpolation=cv2.INTER_AREA)
+                st.session_state.samples.append(face)
+                st.success(f"Sample added. Total: {len(st.session_state.samples)}")
+                add_log(f"Authorized face sample captured ({len(st.session_state.samples)} total)")
+    with c2:
+        if st.button(
+            "Train face profile", use_container_width=True,
+            disabled=len(st.session_state.samples) < 3,
+        ):
+            recognizer = create_recognizer()
+            if recognizer is None:
+                st.error("LBPH is unavailable. Install opencv-contrib-python-headless and remove opencv-python.")
+            else:
+                recognizer.train(
+                    st.session_state.samples,
+                    np.array([1] * len(st.session_state.samples), dtype=np.int32),
+                )
+                st.session_state.recognizer = recognizer
+                st.success("Authorized profile trained.")
+                add_log("Authorized face profile trained")
+    with c3:
+        if st.button("Clear registration", use_container_width=True):
+            st.session_state.samples = []
+            st.session_state.recognizer = None
+            add_log("Authorized face profile cleared")
+            st.rerun()
+    st.markdown(f"**Samples collected:** {len(st.session_state.samples)} / recommended 5–8")
+    if st.session_state.recognizer is not None:
+        st.success("Profile status: READY")
     else:
-        entries_html = "".join(
-            f"<div class='log-entry'><span class='log-time'>[{t}]</span>{msg}</div>"
-            for t, msg in st.session_state.activity_log
-        )
-    log_placeholder.markdown(f"<div class='log-card'>{entries_html}</div>", unsafe_allow_html=True)
+        st.warning("Profile status: NOT REGISTERED")
+    st.caption("Tip: capture 5–8 samples with small changes in head angle and lighting. Avoid extreme pose changes.")
 
+# Live test
+with test_tab:
+    st.markdown("### Live security test")
+    if st.session_state.recognizer is None:
+        st.warning("Register and train an authorized face profile before starting the live test.")
+    st.write("Allow browser camera permission when prompted. For best results, use good front lighting and keep the face clearly visible.")
+    shared = st.session_state.shared
+    recognizer_model = st.session_state.recognizer
+    threshold = float(st.session_state.threshold)
 
-if not start:
-    render_idle_dashboard()
+    class PrivacyProcessor:
+        def __init__(self):
+            self.face_cascade = cv2.CascadeClassifier(str(CASCADE_PATH))
+            self.recognizer = recognizer_model
+            self.shared = shared
 
-# =========================================================
-# ACTIVITY LOG SECTION
-# =========================================================
-st.markdown("<div class='section-header' style='margin-top:6px;'>🗂️ ACTIVITY LOG</div>", unsafe_allow_html=True)
-log_placeholder = st.empty()
-render_activity_log()
-
-# =========================================================
-# CAMERA LOOP
-# =========================================================
-if start:
-
-    cap = cv2.VideoCapture(0)
-
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-    if not cap.isOpened():
-        st.error("Camera not found")
-        stop_alarm()
-
-    else:
-        last_state = None          # tracks "secure" / "alert" for activity log de-duplication
-        last_camera_state = None   # tracks camera card visual state to avoid restarting the pulse animation
-
-        try:
-            while True:
-
-                success, frame = cap.read()
-
-                if not success:
-                    break
-
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-                faces = face_cascade.detectMultiScale(
-                    gray,
-                    scaleFactor=1.1,
-                    minNeighbors=5
+        def recv(self, frame):
+            image = frame.to_ndarray(format="bgr24")
+            # Detect on the full-resolution frame; return the original-size frame
+            # to avoid making the displayed camera preview look soft.
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            faces = self.face_cascade.detectMultiScale(
+                gray, scaleFactor=1.08, minNeighbors=5, minSize=(65, 65)
+            )
+            authorized_count = 0
+            unauthorized_count = 0
+            for (x, y, w, h) in faces:
+                crop = cv2.resize(
+                    gray[y:y+h, x:x+w], (200, 200), interpolation=cv2.INTER_AREA
                 )
-
-                for (x, y, w, h) in faces:
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-                frame_placeholder.image(
-                    rgb,
-                    channels="RGB",
-                    use_container_width=False
-                )
-
-                render_metric_card(
-                    camera_placeholder,
-                    "📷", "Camera Status",
-                    "<span class='status-dot dot-green'></span>Online"
-                )
-
-                render_metric_card(
-                    faces_placeholder,
-                    "👤", "Faces Detected",
-                    str(len(faces))
-                )
-
-                if len(faces) > 1:
-
-                    # Only touch the camera card's visual state on a TRANSITION,
-                    # so the red pulse animation runs continuously without restarting.
-                    if last_camera_state != "alert":
-                        with camera_style_placeholder:
-                            set_camera_card_state("alert")
-                        last_camera_state = "alert"
-
-                    status_placeholder.markdown(
-                        "<div class='status-banner banner-alert'>🚨 SHOULDER SURFING DETECTED</div>",
-                        unsafe_allow_html=True
-                    )
-
-                    render_metric_card(
-                        threat_placeholder,
-                        "⚠️", "Threat Level",
-                        "<span class='badge badge-red'>HIGH</span>"
-                    )
-
-                    render_metric_card(
-                        alarm_placeholder,
-                        "🔔", "Alarm Status",
-                        "<span class='badge badge-red-flash'>🔴 ON</span>"
-                    )
-
-                    start_alarm()
-
-                    if last_state != "alert":
-                        add_log("🚨 Shoulder surfing detected — alarm triggered")
-                        last_state = "alert"
-
+                matched = False
+                if self.recognizer is not None:
+                    label, confidence = self.recognizer.predict(crop)
+                    matched = label == 1 and confidence < threshold
+                if matched:
+                    authorized_count += 1
+                    color, tag = (55, 205, 145), "AUTHORIZED"
                 else:
-
-                    if last_camera_state != "safe":
-                        with camera_style_placeholder:
-                            set_camera_card_state("safe")
-                        last_camera_state = "safe"
-
-                    status_placeholder.markdown(
-                        "<div class='status-banner banner-secure'>🟢 SYSTEM SECURE</div>",
-                        unsafe_allow_html=True
-                    )
-
-                    render_metric_card(
-                        threat_placeholder,
-                        "⚠️", "Threat Level",
-                        "<span class='badge badge-green'>LOW</span>"
-                    )
-
-                    render_metric_card(
-                        alarm_placeholder,
-                        "🔔", "Alarm Status",
-                        "<span class='badge badge-green'>OFF</span>"
-                    )
-
-                    stop_alarm()
-
-                    if last_state != "secure":
-                        add_log("🟢 System secure — no threat detected")
-                        last_state = "secure"
-
-                render_metric_card(
-                    time_placeholder,
-                    "🕒", "Current Time",
-                    datetime.now().strftime("%H:%M:%S")
+                    unauthorized_count += 1
+                    color, tag = (70, 85, 245), "UNRECOGNIZED"
+                cv2.rectangle(image, (x, y), (x+w, y+h), color, 2)
+                cv2.putText(
+                    image, tag, (x, max(24, y-9)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.58, color, 2, cv2.LINE_AA
                 )
 
-                render_activity_log()
+            threat = unauthorized_count > 0 or len(faces) > 1
+            with self.shared["lock"]:
+                self.shared["faces"] = len(faces)
+                self.shared["authorized"] = authorized_count
+                self.shared["unauthorized"] = unauthorized_count
+                self.shared["threat"] = threat
+                self.shared["last_event"] = "Potential privacy threat" if threat else "System secure"
+            if threat:
+                cv2.rectangle(image, (0, 0), (image.shape[1], 42), (35, 35, 90), -1)
+                cv2.putText(
+                    image, "PRIVACY THREAT - CONTENT PROTECTED", (14, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (90, 100, 255), 2, cv2.LINE_AA
+                )
+            return av.VideoFrame.from_ndarray(image, format="bgr24")
 
-        finally:
-            cap.release()
-            stop_alarm()
+    rtc_config = RTCConfiguration({
+        "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+    })
+    webrtc_ctx = webrtc_streamer(
+        key="dhananjay-security-camera-v2",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration=rtc_config,
+        video_processor_factory=PrivacyProcessor,
+        # Ask the browser for HD video; actual resolution depends on camera/browser.
+        media_stream_constraints={
+            "video": {
+                "width": {"ideal": 1280},
+                "height": {"ideal": 720},
+                "frameRate": {"ideal": 24, "max": 30},
+            },
+            "audio": False,
+        },
+        async_processing=True,
+    )
+    st.session_state.monitoring_active = bool(webrtc_ctx.state.playing)
+    if not st.session_state.monitoring_active:
+        st.caption("Camera is stopped. Press START to begin the test.")
+    else:
+        st.caption("HD is requested from the browser camera. Camera hardware and browser negotiation determine the actual resolution.")
+
+    st_autorefresh(interval=1200, key="security_dashboard_refresh")
+    with shared["lock"]:
+        threat_now = shared["threat"]
+        faces_now = shared["faces"]
+        auth_now = shared["authorized"]
+        unauth_now = shared["unauthorized"]
+
+    a, b, c, d = st.columns(4)
+    for col, label, value in [
+        (a, "FACES", faces_now), (b, "AUTHORIZED", auth_now),
+        (c, "UNRECOGNIZED", unauth_now),
+        (d, "THREAT", "HIGH" if threat_now else ("LOW" if webrtc_ctx.state.playing else "IDLE")),
+    ]:
+        with col:
+            st.metric(label, value)
+
+    if threat_now:
+        st.error("Potential shoulder surfing detected. Confidential content is protected.")
+        if st.session_state.alarm_enabled:
+            components.html(
+                """
+                <script>
+                (() => {
+                  try {
+                    const C = window.AudioContext || window.webkitAudioContext;
+                    const ctx = new C();
+                    if (ctx.state === 'suspended') ctx.resume();
+                    const osc = ctx.createOscillator();
+                    const gain = ctx.createGain();
+                    osc.type = 'square'; osc.frequency.value = 880;
+                    gain.gain.value = 0.045;
+                    osc.connect(gain); gain.connect(ctx.destination);
+                    osc.start(); osc.stop(ctx.currentTime + 0.35);
+                  } catch (e) {}
+                })();
+                </script>
+                """,
+                height=0,
+            )
+    elif webrtc_ctx.state.playing:
+        st.success("No potential threat detected. Confidential demo content is visible.")
+    else:
+        st.info("Start the camera to begin monitoring.")
+
+    st.markdown("#### Confidential workspace")
+    if threat_now:
+        st.markdown(
+            '<div class="workspace"><div class="workspace-label">DEMO BANKING PORTAL</div>'
+            '<div style="filter:blur(9px);user-select:none;pointer-events:none">'
+            '<h3>Account holder: Demo User</h3><h2>₹2,45,800</h2>'
+            '<p>Account number: XXXX XXXX 4821</p><p>Recent transaction: ₹12,500</p></div>'
+            '<span class="status-pill bad">UNAUTHORIZED VIEW RISK — CONTENT BLURRED</span></div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<div class="workspace"><div class="workspace-label">DEMO BANKING PORTAL</div>'
+            '<h3>Account holder: Demo User</h3><h2>₹2,45,800</h2>'
+            '<p>Account number: XXXX XXXX 4821</p><p>Recent transaction: ₹12,500</p>'
+            '<span class="status-pill good">AUTHORIZED VIEW — CONTENT VISIBLE</span></div>',
+            unsafe_allow_html=True,
+        )
+
+# Logs
+with logs_tab:
+    st.markdown("### Detection and system activity")
+    entries = read_logs()
+    if entries:
+        for entry in entries[:50]:
+            st.markdown(f'<div class="log-entry">{entry}</div>', unsafe_allow_html=True)
+    else:
+        st.info("No activity has been recorded yet.")
+    if st.button("Refresh logs"):
+        st.rerun()
+
+# Settings
+with settings_tab:
+    st.markdown("### Detection settings")
+    st.session_state.alarm_enabled = st.toggle("Enable browser alert tone", value=st.session_state.alarm_enabled)
+    st.session_state.threshold = st.slider(
+        "LBPH match threshold (lower is stricter)",
+        min_value=40.0, max_value=100.0, value=float(st.session_state.threshold), step=1.0,
+        help="This is a prototype tuning value. Lower values require a closer image match.",
+    )
+    st.caption("Recommended starting point: 75. A lower threshold may reject the registered user; a higher threshold may accept an unknown face.")
+    st.warning("LBPH is a basic demonstration recognizer, not secure biometric authentication. Do not use this prototype to protect real banking or sensitive data.")
+    st.caption("Camera resolution is requested as 1280×720. The browser and webcam may negotiate a different resolution.")
