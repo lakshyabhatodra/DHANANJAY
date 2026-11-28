@@ -45,7 +45,5 @@ Webcam
 **Tech Trojans**
 
 - Lakshya Bhatodra
-- Aastha Rathore
 - Ashmit Yadav
-- Anisha Bairagi
-- Khushi Chouhan
+- Abhijeet Singh
